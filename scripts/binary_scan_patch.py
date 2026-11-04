@@ -34,7 +34,7 @@ python binary_scan_patch.py --pdf a.pdf --box 1080,385,1330,430 \
 # 3) 改写：把 15 换成 28
 python binary_scan_patch.py --pdf a.pdf --out b.pdf \
     --erase 1252,390,1292,424 --text 28 \
-    --font C:/Windows/Fonts/simfang.ttf --size 31 --stroke 2 --phase 5,4 \
+    --font C:/Windows/Fonts/simfang.ttf --size 29 --stroke 2 --phase 6,2 \
     --ink-left 1270 --baseline 416
 """
 from __future__ import annotations
