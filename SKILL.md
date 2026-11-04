@@ -1,6 +1,6 @@
 ---
 name: pdf-image-text-patch
-description: 在 PDF 或位图截图里精准改写少量文字（表格字段、占位符、截图里的数字或短文本），要求字体、字号、基线、颜色与原内容严丝合缝。当需要替换 PDF 表格字段值或占位符、修改扫描件与截图里的文字、且改动不能被一眼看出时使用。关键词：PDF改字、替换字段、占位符、截图改字、改数字、字体反查、光学对齐、redaction。
+description: 在 PDF、扫描件或位图截图里精准改写少量文字（表格字段、占位符、日期、编号、截图里的数字或短文本），要求字体、字号、基线、颜色与原内容严丝合缝。当需要替换 PDF 表格字段值或占位符、修改扫描件（含 1bit 黑白扫描）与截图里的文字、且改动不能被一眼看出时使用。关键词：PDF改字、扫描件改字、替换字段、占位符、改数字、改日期、字体反查、光学对齐、redaction、二值图、1bit。
 agent_created: true
 ---
 
@@ -21,11 +21,23 @@ agent_created: true
 | 载体 | 判断 | 走哪条路 |
 |---|---|---|
 | PDF，文字可选可搜 | `page.get_text()` 有内容 | **矢量路径**（redaction + 重新嵌入字体） |
-| PDF，扫描件 | 抽不出文字 | 先转图，走**位图路径** |
+| PDF，扫描件（灰度/彩色） | 抽不出文字，像素值多于两种 | 先转图，走**位图路径** |
+| PDF，扫描件（纯二值） | 抽不出文字，像素只有 0/255、`bpc=1` | **二值路径**（1bit 进 1bit 出） |
 | JPG / PNG / 截图 | —— | **位图路径** |
 
 判定命令：`python scripts/pdf_field_replace.py --pdf x.pdf --value XXX --probe`
 有输出且能定位到标签，就是矢量 PDF。
+
+扫描件再补一刀，确认是不是纯二值：
+
+```bash
+python scripts/binary_scan_patch.py --pdf x.pdf --probe
+# 末尾会打印「二值: 是 / 否」
+```
+
+**这一步别省。** 把二值图当灰度图处理，会往纯黑白里塞带灰度边的字，
+放大就是一块边缘发虚的补丁——比位置不准更显眼。反过来灰度图硬走二值路径，
+原本该有的柔边会被削成硬边。判错了，后面每一步都是白做。
 
 ## 通用六步
 
@@ -34,7 +46,8 @@ agent_created: true
 ```
 
 两条路径共用这个骨架，区别只在"像素"还是"文本对象"。细节见
-`references/pdf-workflow.md` 和 `references/image-workflow.md`。
+`references/pdf-workflow.md`、`references/image-workflow.md` 和
+`references/binary-scan-workflow.md`。
 
 **贯穿全程的第一原则：只改必须改的那几个字符。**
 要改 `12:34` 里的 `34`，就别碰 `12:`——锚点字原样保留，"像不像"由原图自己保证。
@@ -98,7 +111,44 @@ python scripts/img_text_replace.py --img a.jpg --out b.jpg \
 | `--blur` | 按梯度对齐扫。原图平均梯度约 0.29 时 `blur≈0.65`；`0` 太锐、`0.85` 比原图还糊 |
 | `--ink` | 用反查给出的自然墨迹尺寸，缩放 **≤3%**；超 5% 字形会被各向异性拉伸搞坏 |
 
-## 校验清单（两条路径都要过）
+## 二值路径（1bit 扫描件）
+
+```bash
+# 1) 切字：确认框选区域里每个字落在哪几列
+python scripts/binary_scan_patch.py --pdf a.pdf --box 1085,385,1330,430 \
+    --ref-text "2026年1月15日" --probe
+
+# 2) 反查字体：拿原图已有的字当锚点，搜 字体×字号×描边×相位（约 3 秒）
+python scripts/binary_scan_patch.py --pdf a.pdf --box 1085,385,1330,430 \
+    --ref-text "2026年1月15日" --fit-chars 206 --text 28 --fit
+
+# 3) 改写：把 15 换成 28
+python scripts/binary_scan_patch.py --pdf a.pdf --out b.pdf \
+    --erase 1252,390,1292,424 --text 28 \
+    --font C:/Windows/Fonts/simfang.ttf --size 29 --stroke 2 --phase 6,2 \
+    --ink-left 1270 --baseline 416
+```
+
+这条路径和位图路径是**反着来**的，四条规矩：
+
+| 规矩 | 为什么 |
+|---|---|
+| **1bit 进 1bit 出，中间不许有灰度** | 二值图没有过渡像素，alpha 混合/高斯柔边造出来的灰值就是破绽 |
+| **渲染走「超采样 → 面积平均 → 阈值 0.5」** | 等价于模拟扫描仪对连续调原稿做 1bit 采样；直接渲染点阵字形不受控 |
+| **相位（`--phase kx,ky`，1/8px）必须搜** | 同一套字体字号，换个相位笔画能差 1~2px，在 12px 宽的数字上是肉眼可见的 |
+| **按自然尺寸放，不要缩放** | 缩放会重采样出灰度、阈值化后笔画断或粘；1px 损伤在 12px 字形上占 8% |
+
+对齐用**锚点字墨迹左缘 + 整串底边（基线）**，默认锚点取新串最后一个字——
+它和后面那个原字相邻，间距最敏感。**别整串居中**：新旧串宽度差 1px，
+居中就会让左右间距变成 13/12，眼睛能抓到"偏了一格"。
+
+回填 PDF **新建同尺寸页 + `insert_image`**，不要 `replace_image`（后者留孤儿图像对象，
+文件从 21KB 涨到 73KB）。PNG 用 `convert("1")` 存，`bpc=1` 能保住。
+
+导出图按**原生 dpi** 出。源件 200dpi 就出 200dpi，拉到 1200dpi 只是插值放大，
+一个像素的信息都没多——"清晰度匹配"在这种文件上等于"别把分辨率吹起来"。
+
+## 校验清单（三条路径都要过）
 
 **矢量**
 - [ ] 全文再搜不到旧值
@@ -110,6 +160,12 @@ python scripts/img_text_replace.py --img a.jpg --out b.jpg \
 - [ ] 目标区外全图最大差异 < 15、均值 < 1（属 JPEG 重编码噪声）
 - [ ] 峰值 alpha = 1.0（模糊没把字压淡）
 - [ ] 8 倍放大逐字比对：笔画粗细、字高、基线、颜色、边缘柔度
+
+**二值**
+- [ ] 逐像素 diff 的 bbox **完全落在抹除框内**（这条最硬，能抓住贴图偏移一位）
+- [ ] 差异像素数 > 0（等于 0 说明压根没改到）
+- [ ] 输出图仍为 1bpc，页面尺寸/元数据与原件一致
+- [ ] 6~8 倍放大逐字比对：笔画粗细、字高、基线（二值图没有柔度和颜色可比）
 
 ## 交付习惯
 
@@ -128,3 +184,4 @@ python scripts/img_text_replace.py --img a.jpg --out b.jpg \
 
 - `references/pdf-workflow.md` — 矢量路径全量细节：锚定逻辑、redaction 参数、光学对齐量测
 - `references/image-workflow.md` — 位图路径全量细节：字体打分、背景重建、柔边与颜色标定、尺寸微调
+- `references/binary-scan-workflow.md` — 二值路径全量细节：二值判定、相位与降采样、字高定标、逐像素校验
